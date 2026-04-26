@@ -7,6 +7,6 @@ Key problems solved from SmallClawLM:
 - Auth auto-refresh when tokens expire
 """
 
-from notebooklm_agent.auth.pool import AuthPool, get_auth, get_client
+from notebooklm_agent.auth.pool import AuthPool, get_auth, get_client, close_pool
 
-__all__ = ["AuthPool", "get_auth", "get_client"]
+__all__ = ["AuthPool", "get_auth", "get_client", "close_pool"]
