@@ -1,22 +1,33 @@
-"""Brain module - NotebookLM as the reasoning engine.
+"""Brain module - One notebook per user, forever."""
 
-The Brain is the core of notebooklm-agent. It wraps NotebookLM's chat API
-with auto-bootstrap, research pipeline, and artifact generation.
-No smolagents. No local LLM. Gemini through NotebookLM does all reasoning.
-"""
-
-from notebooklm_agent.brain.bootstrap import BrainBootstrapper, BOOTSTRAP_SOURCE, BOOTSTRAP_TITLE
+from notebooklm_agent.brain.constants import MAX_SOURCES, BOOTSTRAP_TITLE, USER_SOURCE_PREFIX
+from notebooklm_agent.brain.core import Brain, BrainError, BrainNotReadyError
+from notebooklm_agent.brain.bootstrap import BrainBootstrapper, MIN_SOURCES_FOR_READY
+from notebooklm_agent.brain.user_brain import UserBrain
 from notebooklm_agent.brain.chat import ChatSession
-from notebooklm_agent.brain.research import ResearchPipeline
-from notebooklm_agent.brain.artifacts import ArtifactGenerator
-from notebooklm_agent.brain.core import Brain
+from notebooklm_agent.brain.research import ResearchPipeline, ResearchResult, ResearchMode
+from notebooklm_agent.brain.artifacts import ArtifactGenerator, ArtifactResult, ArtifactType
 
 __all__ = [
-    "Brain",
-    "BrainBootstrapper",
-    "BOOTSTRAP_SOURCE",
+    # Constants
+    "MAX_SOURCES",
     "BOOTSTRAP_TITLE",
+    "USER_SOURCE_PREFIX",
+    # Core
+    "Brain",
+    "BrainError",
+    "BrainNotReadyError",
+    # Bootstrap
+    "BrainBootstrapper",
+    "MIN_SOURCES_FOR_READY",
+    # User brain
+    "UserBrain",
+    # Components
     "ChatSession",
     "ResearchPipeline",
+    "ResearchResult",
+    "ResearchMode",
     "ArtifactGenerator",
+    "ArtifactResult",
+    "ArtifactType",
 ]

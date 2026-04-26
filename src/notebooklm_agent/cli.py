@@ -4,7 +4,8 @@ import asyncio
 import click
 import logging
 
-from notebooklm_agent.agent import Agent, AgentMode
+from notebooklm_agent.brain.core import Brain
+from notebooklm_agent.brain.user_brain import UserBrain
 from notebooklm_agent.auth import get_client, close_pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -21,16 +22,22 @@ def main(debug):
 
 @main.command()
 @click.option("--notebook", "-n", help="Existing notebook ID")
-@click.option("--title", "-t", default="NotebookLM Agent", help="Notebook title")
 @click.argument("query")
-def run(query, notebook, title):
+def run(query, notebook):
     """Ask the agent a question."""
     async def _run():
         try:
             client = await get_client()
-            agent = Agent(client, default_notebook_id=notebook)
-            result = await agent.run(query, chat_id="cli")
-            click.echo(result.answer)
+            if notebook:
+                brain = Brain(client, notebook_id=notebook)
+                await brain.ensure_ready()
+            else:
+                ub = UserBrain(client)
+                info = await ub.get_or_create("cli-user")
+                brain = Brain(client, notebook_id=info["notebook_id"])
+                await brain.ensure_ready()
+            answer = await brain.ask(query)
+            click.echo(answer)
         finally:
             await close_pool()
     asyncio.run(_run())
@@ -38,15 +45,28 @@ def run(query, notebook, title):
 
 @main.command()
 @click.option("--mode", type=click.Choice(["fast", "deep"]), default="fast")
+@click.option("--notebook", "-n", help="Existing notebook ID")
 @click.argument("topic")
-def research(topic, mode):
+def research(topic, mode, notebook):
     """Research a topic using NotebookLM."""
     async def _run():
         try:
             client = await get_client()
-            agent = Agent(client)
-            result = await agent.run(f"research {topic}", chat_id="cli")
-            click.echo(result.answer)
+            if notebook:
+                brain = Brain(client, notebook_id=notebook)
+                await brain.ensure_ready()
+            else:
+                ub = UserBrain(client)
+                info = await ub.get_or_create("cli-user")
+                brain = Brain(client, notebook_id=info["notebook_id"])
+                await brain.ensure_ready()
+            result = await brain.research(topic, mode=mode)
+            if result.success:
+                click.echo(f"Research complete. Added {result.source_count} sources.")
+                answer = await brain.ask(topic)
+                click.echo(answer)
+            else:
+                click.echo(f"Research failed: {result.error}")
         finally:
             await close_pool()
     asyncio.run(_run())
@@ -67,12 +87,12 @@ def serve(gateway, token, max_steps):
                     return
                 from notebooklm_agent.gateways.telegram import TelegramGateway
                 gw = TelegramGateway(token=token, max_steps=max_steps)
-                click.echo(f"Starting Telegram gateway...")
+                click.echo("Starting Telegram gateway...")
                 await gw.run()
             elif gateway == "web":
                 click.echo("Web gateway coming soon!")
             else:
-                click.echo("CLI gateway: just use "nlm-agent run <query>"")
+                click.echo("CLI gateway: just use nlm-agent run <query>")
         finally:
             await close_pool()
     asyncio.run(_serve())

@@ -1,17 +1,18 @@
-"""Brain - The core orchestrator that ties everything together.
+"""Brain - The core orchestrator. One Brain = One NotebookLM notebook.
 
-One Brain = One NotebookLM notebook. The Brain manages:
+The Brain manages:
 - Bootstrap: Auto-seeds new notebooks with agent instructions
-- Chat: Direct Q&A via chat.ask() (fast path)
-- Research: Atomic start->poll->import->wait pipeline
+- Chat: Direct Q&A via chat.ask() (fast path, 90% of queries)
+- Research: Atomic start->poll->import->wait pipeline with source cap
 - Artifacts: Podcast, report, quiz, mindmap generation
 - Memory: Persistent facts stored as notebook sources
 
 This is the primary interface for gateways (Telegram, CLI, etc.).
+One user = one brain = one notebook. Forever.
 
 Usage:
     brain = Brain(client, notebook_id="abc123")
-    await brain.ensure_ready()  # Bootstrap + auto-research if needed
+    await brain.ensure_ready()  # Bootstrap if needed
     answer = await brain.ask("What is quantum computing?")
 """
 
@@ -19,6 +20,7 @@ import logging
 from typing import Any
 
 from notebooklm_agent.brain.bootstrap import BrainBootstrapper, MIN_SOURCES_FOR_READY
+from notebooklm_agent.brain.constants import BOOTSTRAP_TITLE, MAX_SOURCES
 from notebooklm_agent.brain.chat import ChatSession
 from notebooklm_agent.brain.research import ResearchPipeline, ResearchMode, ResearchResult
 from notebooklm_agent.brain.artifacts import ArtifactGenerator, ArtifactResult, ArtifactType
@@ -44,7 +46,7 @@ class Brain:
     - Auto-research: If brain is empty, researches the user's topic before answering
     - Chat: Direct Q&A with conversation context
     - Artifacts: Generate podcasts, reports, etc.
-    - Memory: Persistent facts that survive across sessions
+    - Source lifecycle: Enforce cap, protect bootstrap, prune stale research
 
     Usage:
         # Create a new brain (auto-creates notebook)
@@ -84,255 +86,264 @@ class Brain:
 
         This is the preferred way to create a Brain from scratch.
         """
-        nb = await client.notebooks.create(title)
-        brain = cls(client, notebook_id=nb.id, title=title, **kwargs)
-        return brain
+        notebook = await client.notebooks.create(title=title)
+        notebook_id = notebook.id if hasattr(notebook, 'id') else str(notebook)
+        logger.info(f"Created notebook: {title} ({notebook_id})")
 
-    # ─── Properties ───
+        brain = cls(client, notebook_id=notebook_id, title=title)
+        await brain.bootstrap()
+        return brain
 
     @property
     def notebook_id(self) -> str | None:
+        """The notebook this brain is attached to."""
         return self._notebook_id
 
     @property
     def is_ready(self) -> bool:
+        """Whether bootstrap has completed and brain is usable."""
         return self._ready
-
-    @property
-    def chat(self) -> ChatSession:
-        """Get or create the chat session."""
-        if self._chat is None:
-            self._chat = ChatSession(self.client, self._notebook_id)
-        return self._chat
-
-    @property
-    def research(self) -> ResearchPipeline:
-        """Get or create the research pipeline."""
-        if self._research is None:
-            self._research = ResearchPipeline(self.client)
-        return self._research
-
-    @property
-    def artifact_generator(self) -> ArtifactGenerator:
-        """Get or create the artifact generator."""
-        if self._artifacts is None:
-            self._artifacts = ArtifactGenerator(self.client)
-        return self._artifacts
 
     # ─── Lifecycle ───
 
-    async def ensure_ready(self, auto_topic: str | None = None) -> dict:
-        """Ensure the brain is bootstrapped and has sources.
+    async def ensure_ready(self) -> None:
+        """Ensure brain is bootstrapped and ready for chat.
 
-        If the notebook is empty (only has bootstrap source), this will:
-        1. Upload bootstrap source if not present
-        2. Auto-research the given topic if no sources exist
-        3. Wait for sources to be processed
-
-        Args:
-            auto_topic: Topic to research if brain is empty.
-                        If None and brain is empty, raises BrainNotReadyError.
-
-        Returns:
-            Dict with bootstrap status and source count.
+        Idempotent — safe to call multiple times.
         """
         if self._ready:
-            return {"status": "already_ready", "source_count": "??"}
+            return
 
-        # 1. Create notebook if needed
-        if not self._notebook_id:
-            nb = await self.client.notebooks.create(self._title)
-            self._notebook_id = nb.id
-            logger.info(f"Created notebook: {self._notebook_id}")
-
-        # 2. Bootstrap
-        bootstrapper = BrainBootstrapper(self.client)
-        await bootstrapper.bootstrap(self._notebook_id)
-        logger.info(f"Bootstrapped notebook: {self._notebook_id}")
-
-        # 3. Check source count
-        source_count = await bootstrapper.source_count(self._notebook_id)
-        if source_count >= MIN_SOURCES_FOR_READY - 1:  # -1 because bootstrap counts as 1
-            self._ready = True
-            return {"status": "ready", "source_count": source_count}
-
-        # 4. Auto-research if topic provided
-        if auto_topic:
-            logger.info(f"Auto-researching: {auto_topic}")
-            result = await self.research.brain_research(
-                self._notebook_id, auto_topic, mode="fast"
+        # Check if bootstrap source exists
+        try:
+            sources = await self.client.sources.list(self._notebook_id)
+            bootstrap_found = any(
+                getattr(s, 'title', '') == BOOTSTRAP_TITLE
+                for s in sources
             )
-
-            if result.success and result.source_count > 0:
+            if bootstrap_found:
+                logger.info(f"Brain already bootstrapped ({len(sources)} sources)")
                 self._ready = True
-                return {
-                    "status": "ready",
-                    "source_count": result.source_count,
-                    "research_task_id": result.task_id,
-                }
-            elif result.success and result.source_count == 0:
-                self._ready = True  # Brain has bootstrap, just no web sources
-                return {"status": "ready_no_sources", "source_count": 0}
-            else:
-                return {"status": "research_failed", "error": result.error}
+                return
+        except Exception as e:
+            logger.warning(f"Failed to check sources: {e}")
 
-        # No topic provided and brain is empty
-        self._ready = True  # Bootstrap exists, but brain will give limited answers
-        return {"status": "bootstrapped_no_sources", "source_count": source_count}
+        # Need to bootstrap
+        await self.bootstrap()
 
-    # ─── Core Operations ───
+    async def bootstrap(self) -> None:
+        """Bootstrap the brain with agent instructions.
 
-    async def ask(self, question: str, auto_research: bool = True) -> str:
-        """Ask a question to the brain.
-
-        Args:
-            question: The question to ask.
-            auto_research: If True and brain lacks sources, auto-research the topic.
-
-        Returns:
-            The answer text with citations.
+        Uploads the identity, behavior, and capabilities sources.
+        If already bootstrapped, does nothing.
         """
-        # Auto-ensure ready
-        if not self._ready:
-            await self.ensure_ready(auto_topic=question if auto_research else None)
+        if not self._bootstrapper:
+            self._bootstrapper = BrainBootstrapper(self.client)
 
-        # Set memory prefix
-        self.chat.set_memory(self._facts)
-        return await self.chat.ask(question)
+        await self._bootstrapper.bootstrap(self._notebook_id)
+        self._ready = True
+        logger.info(f"Brain bootstrapped: {self._notebook_id}")
 
-    async def research_topic(self, query: str, mode: str = "fast") -> ResearchResult:
-        """Research a topic and add sources to the brain.
+    # ─── Chat ───
+
+    async def ask(self, question: str, context: str | None = None) -> str:
+        """Ask a question using the brain's sources.
+
+        This is the FAST PATH — direct chat.ask() for 90% of queries.
+        No research, no tools, just Gemini reasoning over sources.
 
         Args:
-            query: Research question.
-            mode: "fast" (2 min) or "deep" (15 min).
+            question: The user's question
+            context: Optional additional context to prepend
 
         Returns:
-            ResearchResult with success status and source count.
+            The answer text with citations
         """
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID. Call ensure_ready() or create() first.")
+            raise BrainNotReadyError("Brain has no notebook_id")
 
-        return await self.research.brain_research(self._notebook_id, query, mode=mode)
+        if not self._chat:
+            self._chat = ChatSession(self.client, self._notebook_id)
+            self._chat.set_memory(self._facts)
+
+        prompt = question
+        if context:
+            prompt = f"{context}\n\n{question}"
+
+        return await self._chat.ask(prompt)
+
+    # ─── Research ───
+
+    async def research(self, query: str, mode: str = "fast") -> ResearchResult:
+        """Research a topic and import sources into the brain.
+
+        Automatically enforces source cap after import.
+
+        Args:
+            query: Research question
+            mode: "fast" (90s) or "deep" (15min)
+
+        Returns:
+            ResearchResult with source count
+        """
+        if not self._notebook_id:
+            raise BrainNotReadyError("Brain has no notebook_id")
+
+        if not self._research:
+            self._research = ResearchPipeline(self.client)
+
+        result = await self._research.brain_research(
+            self._notebook_id, query, mode=mode
+        )
+
+        # Enforce source cap after research
+        if result.success:
+            await self._enforce_cap()
+
+        return result
+
+    async def add_source(self, url: str, title: str | None = None) -> str:
+        """Add a URL source to the brain.
+
+        User-added sources get [USER] prefix for protection from auto-pruning.
+        """
+        if not self._notebook_id:
+            raise BrainNotReadyError("Brain has no notebook_id")
+
+        source = await self.client.sources.add_url(
+            self._notebook_id, url
+        )
+
+        # Rename with [USER] prefix for protection from pruning
+        if title:
+            try:
+                await self.client.sources.rename(
+                    self._notebook_id, source.id,
+                    f"[USER] {title}"
+                )
+            except Exception:
+                pass  # rename is best-effort
+
+        # Wait for source to be ready
+        await self.client.sources.wait_until_ready(self._notebook_id, source.id)
+
+        # Enforce source cap
+        await self._enforce_cap()
+
+        return f"Added: {title or url}"
+
+    async def add_text(self, title: str, content: str) -> str:
+        """Add a text source to the brain.
+
+        Text sources get [USER] prefix for protection.
+        """
+        if not self._notebook_id:
+            raise BrainNotReadyError("Brain has no notebook_id")
+
+        protected_title = f"[USER] {title}" if not title.startswith("[USER]") else title
+        source = await self.client.sources.add_text(
+            self._notebook_id, content, title=protected_title
+        )
+
+        return f"Added: {protected_title}"
+
+    # ─── Source Management ───
+
+    async def list_sources(self) -> list[dict]:
+        """List all sources in the brain."""
+        if not self._notebook_id:
+            return []
+        sources = await self.client.sources.list(self._notebook_id)
+        return [
+            {
+                "id": s.id,
+                "title": getattr(s, 'title', 'Untitled'),
+                "protected": (
+                    getattr(s, 'title', '') == BOOTSTRAP_TITLE
+                    or getattr(s, 'title', '').startswith("[USER]")
+                )
+            }
+            for s in sources
+        ]
+
+    async def source_count(self) -> int:
+        """Count sources in the brain."""
+        if not self._notebook_id:
+            return 0
+        sources = await self.client.sources.list(self._notebook_id)
+        return len(sources)
+
+    async def _enforce_cap(self) -> int:
+        """Enforce source cap by pruning research sources.
+
+        Protected sources (bootstrap + [USER] prefix) are never pruned.
+        """
+        if not self._notebook_id:
+            return 0
+
+        sources = await self.client.sources.list(self._notebook_id)
+        if len(sources) <= MAX_SOURCES:
+            return 0
+
+        excess = len(sources) - MAX_SOURCES
+        pruned = 0
+
+        for s in sources:
+            if pruned >= excess:
+                break
+            title = getattr(s, 'title', '')
+            # Protect bootstrap and user-added sources
+            if title == BOOTSTRAP_TITLE or title.startswith("[USER]"):
+                continue
+            try:
+                await self.client.sources.delete(self._notebook_id, s.id)
+                pruned += 1
+                logger.debug(f"Pruned: {title}")
+            except Exception as e:
+                logger.warning(f"Failed to prune {title}: {e}")
+
+        if pruned:
+            logger.info(f"Source cap enforced: pruned {pruned} sources (was {len(sources)})")
+        return pruned
+
+    # ─── Artifacts ───
 
     async def podcast(self, instructions: str | None = None) -> ArtifactResult:
         """Generate a podcast from the brain's sources."""
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        return await self.artifact_generator.generate_podcast(self._notebook_id, instructions)
+            raise BrainNotReadyError("Brain has no notebook_id")
+        if not self._artifacts:
+            self._artifacts = ArtifactGenerator(self.client)
+        return await self._artifacts.generate_podcast(self._notebook_id, instructions)
 
-    async def report(self, custom_prompt: str | None = None) -> ArtifactResult:
+    async def report(self, prompt: str | None = None) -> ArtifactResult:
         """Generate a structured report from the brain's sources."""
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        return await self.artifact_generator.generate_report(self._notebook_id, custom_prompt)
+            raise BrainNotReadyError("Brain has no notebook_id")
+        if not self._artifacts:
+            self._artifacts = ArtifactGenerator(self.client)
+        return await self._artifacts.generate_report(self._notebook_id, prompt)
 
-    async def quiz(self, instructions: str | None = None) -> ArtifactResult:
+    async def quiz(self, topic: str | None = None) -> ArtifactResult:
         """Generate a quiz from the brain's sources."""
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        return await self.artifact_generator.generate_quiz(self._notebook_id, instructions)
+            raise BrainNotReadyError("Brain has no notebook_id")
+        if not self._artifacts:
+            self._artifacts = ArtifactGenerator(self.client)
+        return await self._artifacts.generate_quiz(self._notebook_id, topic)
 
     async def mindmap(self) -> ArtifactResult:
         """Generate a mind map from the brain's sources."""
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        return await self.artifact_generator.generate_mindmap(self._notebook_id)
+            raise BrainNotReadyError("Brain has no notebook_id")
+        if not self._artifacts:
+            self._artifacts = ArtifactGenerator(self.client)
+        return await self._artifacts.generate_mindmap(self._notebook_id)
 
-    async def add_source(self, url: str, title: str | None = None) -> str:
-        """Add a URL as a source to the brain."""
+    async def video(self, instructions: str | None = None) -> ArtifactResult:
+        """Generate an explainer video from the brain's sources."""
         if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        source = await self.client.sources.add_url(
-            self._notebook_id, url
-        )
-        # Rename after adding if title was provided
-        if title:
-            try:
-                source = await self.client.sources.rename(
-                    self._notebook_id, source.id, title
-                )
-            except Exception:
-                logger.warning(f"Could not rename source to {title!r}, using default")
-        # Wait for source to be processed
-        await self.client.sources.wait_until_ready(
-            self._notebook_id, source.id, timeout=60.0
-        )
-        name = title or url
-        return f"Added source: {name} (id: {source.id})"
-
-    async def add_text_source(self, title: str, content: str) -> str:
-        """Add a text source to the brain."""
-        if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        source = await self.client.sources.add_text(
-            self._notebook_id, title=title, content=content
-        )
-        await self.client.sources.wait_until_ready(
-            self._notebook_id, source.id, timeout=60.0
-        )
-        return f"Added text source: {title} (id: {source.id})"
-
-    async def list_sources(self) -> str:
-        """List all sources in the brain's notebook."""
-        if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        sources = await self.client.sources.list(self._notebook_id)
-        if not sources:
-            return "No sources in this notebook yet."
-        lines = [f"Sources in notebook ({len(sources)} total):"]
-        for s in sources:
-            name = getattr(s, "title", None) or getattr(s, "name", str(s.id))
-            lines.append(f"  - {name}")
-        return "\n".join(lines)
-
-    # ─── Memory ───
-
-    def add_fact(self, fact: str) -> None:
-        """Add a fact to the brain's local memory.
-
-        Facts are prepended to chat queries for context persistence.
-        They can also be synced to the notebook as a source.
-        """
-        self._facts.append(fact)
-        # Keep only last 20 facts
-        if len(self._facts) > 20:
-            self._facts = self._facts[-20:]
-
-    async def sync_memory(self) -> None:
-        """Sync local facts to the notebook as a text source.
-
-        This makes facts available to future conversations even
-        after the memory prefix is exceeded.
-        """
-        if not self._notebook_id or not self._facts:
-            return
-        content = "\n".join(f"- {f}" for f in self._facts)
-        await self.client.sources.add_text(
-            self._notebook_id,
-            title="Agent Memory",
-            content=content,
-        )
-
-    # ─── Notebook Management ───
-
-    async def delete_notebook(self) -> bool:
-        """Delete the brain's notebook. Irreversible."""
-        if not self._notebook_id:
-            return False
-        result = await self.client.notebooks.delete(self._notebook_id)
-        self._notebook_id = None
-        self._ready = False
-        return result
-
-    async def rename(self, new_title: str) -> None:
-        """Rename the brain's notebook."""
-        if not self._notebook_id:
-            raise BrainNotReadyError("No notebook ID.")
-        await self.client.notebooks.rename(self._notebook_id, new_title)
-        self._title = new_title
-
-    def __repr__(self) -> str:
-        state = "ready" if self._ready else "not_ready"
-        nb = self._notebook_id[:8] if self._notebook_id else "none"
-        return f"Brain(nb={nb}..., state={state}, facts={len(self._facts)})"
+            raise BrainNotReadyError("Brain has no notebook_id")
+        if not self._artifacts:
+            self._artifacts = ArtifactGenerator(self.client)
+        return await self._artifacts.generate_video(self._notebook_id, instructions)
