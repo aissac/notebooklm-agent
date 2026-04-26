@@ -244,8 +244,16 @@ class Brain:
         if not self._notebook_id:
             raise BrainNotReadyError("No notebook ID.")
         source = await self.client.sources.add_url(
-            self._notebook_id, url, title=title if title else None
+            self._notebook_id, url
         )
+        # Rename after adding if title was provided
+        if title:
+            try:
+                source = await self.client.sources.rename(
+                    self._notebook_id, source.id, title
+                )
+            except Exception:
+                logger.warning(f"Could not rename source to {title!r}, using default")
         # Wait for source to be processed
         await self.client.sources.wait_until_ready(
             self._notebook_id, source.id, timeout=60.0
